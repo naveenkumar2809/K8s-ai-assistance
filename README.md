@@ -8,7 +8,7 @@
 
 **K8s Pilot** is an intelligent, autonomous agent designed to simplify Kubernetes cluster management. By combining real-time monitoring with AI-driven insights, it detects anomalies, recommends optimizations, and provides a context-aware chat interface for natural language interaction with your infrastructure.
 
-> **Note**: Add your screenshots to the `assets/` directory and they will display below.
+![K8s Pilot Preview](./assets/k8s.gif)
 
 ## 🌟 Why K8s Pilot?
 Managing Kubernetes clusters can be complex. K8s Pilot acts as your virtual SRE (Site Reliability Engineer), constantly watching over your pods and nodes. It doesn't just show you graphs; it explains *what* is happening and *how* to fix it.

@@ -3,11 +3,10 @@ from pydantic import BaseModel
 from app.agents.monitor_agent import monitor_agent
 from app.agents.anomaly_agent import anomaly_agent
 from app.agents.recommendation_agent import recommendation_agent
-# Import global store from endpoints to access active recommendations state
-# A better architecture would be a shared state manager, but for now we'll import from endpoints or re-generate
-# Ideally, agents should be stateless services and data passed in, or agents hold state.
-# Let's rely on re-fetching from monitor_agent which is caching/fetching live.
+from app.core.config import settings
 import logging
+import httpx
+import json
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -25,80 +24,131 @@ class SmartChatAgent:
         # 1. Fetch Context
         events = await monitor_agent.get_events()
         metrics = await monitor_agent.get_metrics()
-        logs = await monitor_agent.get_logs() # Empty for now
+        logs = await monitor_agent.get_logs()
         
         # Run analysis (quick re-run to get current anomalies)
         anomalies = anomaly_agent.detect_anomalies(events, metrics, logs)
         recommendations = recommendation_agent.generate_recommendations(anomalies)
-
-        # 2. Intent Recognition & Response Generation
-        if any(w in msg for w in ["status", "health", "overview", "cluster"]):
-            return self._generate_status_response(metrics, anomalies, events)
         
-        elif any(w in msg for w in ["recommend", "suggestion", "optimize", "advice"]):
-            return self._generate_recommendation_response(recommendations)
+        # 2. Build context for LLM
+        context = self._build_cluster_context(metrics, anomalies, recommendations, events, logs)
         
-        elif any(w in msg for w in ["error", "fail", "crash", "bug", "issue", "problem"]):
-            return self._generate_anomaly_response(anomalies)
-
-        elif any(w in msg for w in ["cpu", "memory", "resource", "load"]):
-            return self._generate_metrics_response(metrics)
-            
-        elif any(w in msg for w in ["hello", "hi", "hey"]):
-            return "Hello! I am your AI Kubernetes Assistant. I can help you with cluster status, diagnostics, and optimization recommendations. What would you like to know?"
-            
-        else:
-            return "I'm tuned to assist with Kubernetes operations. Try asking: 'How is the cluster health?', 'Do you have any recommendations?', or 'Show me recent errors'."
-
-    def _generate_status_response(self, metrics, anomalies, events):
-        pod_count = len(set(m.pod_name for m in metrics)) if metrics else "unknown"
-        # Mocking node count as we don't have a node agent yet, or use k8s client
-        node_count = 1 
+        # 3. Call GPT-5 Nano
+        try:
+            llm_response = await self._call_gpt5_nano(message, context)
+            return llm_response
+        except Exception as e:
+            logger.error(f"LLM API error: {e}")
+            # Fallback to template-based response
+            return self._fallback_response(message, metrics, anomalies, recommendations)
+    
+    def _build_cluster_context(self, metrics, anomalies, recommendations, events, logs):
+        """Build a concise context summary for the LLM"""
+        pod_count = len(set(m.pod_name for m in metrics)) if metrics else 0
+        node_count = 1  # Mock
         critical_issues = [a for a in anomalies if a['severity'] == 'critical']
         
+        context = f"""Current Kubernetes Cluster Status:
+- Nodes: {node_count} active
+- Pods: {pod_count} monitored
+- Critical Issues: {len(critical_issues)}
+- Active Recommendations: {len(recommendations)}
+"""
+        
+        if metrics:
+            avg_cpu = sum(m.cpu_usage for m in metrics) / len(metrics)
+            avg_mem = sum(m.memory_usage for m in metrics) / len(metrics)
+            context += f"\nResource Usage:\n- Average CPU: {avg_cpu:.2f}%\n- Average Memory: {avg_mem:.2f}%\n"
+        
+        if anomalies:
+            context += f"\nRecent Anomalies:\n"
+            for a in anomalies[:3]:
+                context += f"- {a['type']}: {a['message']}\n"
+        
+        if recommendations:
+            context += f"\nRecommendations:\n"
+            for r in recommendations[:3]:
+                context += f"- {r.recommendation_type}: {r.suggested_action}\n"
+        
+        if logs:
+            context += f"\nRecent Logs:\n"
+            for log in logs[:3]:
+                context += f"- [{log.level}] {log.message}\n"
+        
+        return context
+    
+    async def _call_gpt5_nano(self, user_message: str, cluster_context: str) -> str:
+        """Call GPT-5 Nano API with cluster context"""
+        system_prompt = f"""You are an AI Kubernetes Assistant named K8s Pilot, helping Naveen manage his Kubernetes cluster.
+
+You have access to real-time cluster data:
+{cluster_context}
+
+Provide helpful, concise, and actionable responses. Use markdown formatting for better readability.
+Be friendly and address the user as Naveen when appropriate."""
+
+        headers = {
+            "Authorization": f"Bearer {settings.GPT_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "model": settings.GPT_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message}
+            ],
+            "temperature": 0.7,
+            "max_tokens": 500
+        }
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                settings.GPT_API_URL,
+                headers=headers,
+                json=payload
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data['choices'][0]['message']['content']
+    
+    def _fallback_response(self, message: str, metrics, anomalies, recommendations):
+        """Fallback to template-based response if LLM fails"""
+        msg = message.lower()
+        
+        if any(w in msg for w in ["status", "health", "overview", "cluster"]):
+            return self._generate_status_response(metrics, anomalies)
+        elif any(w in msg for w in ["recommend", "suggestion", "optimize"]):
+            return self._generate_recommendation_response(recommendations)
+        elif any(w in msg for w in ["hello", "hi", "hey"]):
+            return "Hello Naveen! I am your AI Kubernetes Assistant. I can help you with cluster status, diagnostics, and optimization recommendations. What would you like to know?"
+        else:
+            return "I'm here to help with your Kubernetes cluster. Try asking about cluster health, recommendations, or resource usage."
+    
+    def _generate_status_response(self, metrics, anomalies):
+        pod_count = len(set(m.pod_name for m in metrics)) if metrics else "unknown"
+        critical_issues = [a for a in anomalies if a['severity'] == 'critical']
         status_text = "Healthy" if not critical_issues else "Degraded"
         
         response = f"The cluster status is currently **{status_text}**.\n\n"
-        response += f"- **Nodes**: {node_count} active\n"
         response += f"- **Pods**: ~{pod_count} monitored pods\n"
         
         if critical_issues:
             response += f"- **Issues**: {len(critical_issues)} critical anomalies detected.\n"
-            response += f"  Most recent: {critical_issues[0]['message']}"
         else:
-            response += "- **Issues**: No critical anomalies detected at this time."
-            
+            response += "- **Issues**: No critical anomalies detected."
+        
         return response
-
+    
     def _generate_recommendation_response(self, recommendations):
         if not recommendations:
             return "I don't have any active recommendations right now. Your cluster seems to be running efficiently!"
         
-        response = f"I have generated **{len(recommendations)} recommendations** for optimization:\n\n"
+        response = f"I have **{len(recommendations)} recommendations** for optimization:\n\n"
         for i, rec in enumerate(recommendations[:3], 1):
-            response += f"{i}. **{rec.recommendation_type.replace('_', ' ').title()}**: {rec.suggested_action} (*{rec.resource_name}*)\n"
-            
-        return response
-
-    def _generate_anomaly_response(self, anomalies):
-        if not anomalies:
-            return "Great news! I haven't detected any significant errors or anomalies in the recent logs and events."
-            
-        response = "Here are the recent issues I've found:\n\n"
-        for anomaly in anomalies[:5]:
-             response += f"- **{anomaly['type']}** in *{anomaly['resource']}*: {anomaly['message']}\n"
+            response += f"{i}. **{rec.recommendation_type.replace('_', ' ').title()}**: {rec.suggested_action}\n"
         
         return response
-
-    def _generate_metrics_response(self, metrics):
-        if not metrics:
-            return "I'm not receiving metric data at the moment. Please check the Prometheus connection."
-            
-        # Calc average CPU from sample
-        avg_cpu = sum(m.cpu_usage for m in metrics) / len(metrics)
-        highest_cpu = max(metrics, key=lambda m: m.cpu_usage)
-        
-        return f"Current Resource Usage:\n\n- **Average CPU Load**: {avg_cpu:.2f} cores\n- **Peak Usage**: Pod *{highest_cpu.pod_name}* is using {highest_cpu.cpu_usage:.2f} cores."
 
 chat_agent = SmartChatAgent()
 
